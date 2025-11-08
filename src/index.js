@@ -1,5 +1,6 @@
 require('dotenv').config();
 const axios = require('axios');
+const siwe = require('siwe');
 const { ethers } = require('ethers');
 const fs = require('fs');
 const path = require('path');
@@ -25,7 +26,6 @@ const CONFIRMATIONS = parseInt(process.env.CONFIRMATIONS || '1', 10);
 const STRATEGY_MODE = (process.env.STRATEGY_MODE || 'dominant').toLowerCase();
 const TRIGGER_PCT = process.env.TRIGGER_PCT ? Number(process.env.TRIGGER_PCT) : 60;
 const TRIGGER_BAND = process.env.TRIGGER_BAND ? Number(process.env.TRIGGER_BAND) : 5;
-const AUTH_TOKEN = process.env.AUTH_TOKEN;
 const LOOKBACK_BLOCKS = parseInt(process.env.LOOKBACK_BLOCKS || '500000', 10);
 
 const PRIVATE_KEYS = (process.env.PRIVATE_KEYS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -205,9 +205,9 @@ function fmtUnitsPrec(amount, decimals, precision = 4) {
   }
 }
 
-async function getPositions() {
+async function getPositions(identity) {
   const url = 'https://api.limitless.exchange/portfolio/positions';
-  const res = await axios.get(url, { timeout: 15000, headers: { identity: AUTH_TOKEN } });
+  const res = await axios.get(url, { timeout: 15000, headers: { identity: `Bearer ${identity}` } });
   return res.data;
 }
 
@@ -681,9 +681,68 @@ async function runForWallet(wallet, provider) {
   return setInterval(tick, POLL_INTERVAL_MS);
 }
 
+function createSiweMessage(params) {
+  const siweMessage = new siwe.SiweMessage(params);
+  return siweMessage.prepareMessage();
+}
+
+async function authenticate(wallet, { address, nonce, expires_at }) {
+  const url = 'https://auth.privy.io/api/v1/siwe/authenticate';
+  const obj = {
+    domain: "limitless.exchange",
+    address,
+    uri: "https://limitless.exchange",
+    version: "1",
+    chainId: 8453,
+    issuedAt: expires_at,
+    nonce,
+    statement: "By signing, you are proving you own this wallet and logging in. This does not initiate a transaction or cost any fees.",
+  };
+  const message = (await createSiweMessage(obj)) + '\nResources:\n- https://privy.io';
+  const res = await axios.post(url,
+    {
+      message,
+      "signature": await wallet.signMessage(message),
+      "chainId": "eip155:8453",
+      "walletClientType": "metamask",
+      "connectorType": "injected",
+      "mode": "login-or-sign-up"
+    },
+    {
+      timeout: 15000,
+      headers: {
+        "privy-app-id": "cm5pgksxs05f9428uup8tuyd4",
+        "privy-ca-id": "b37bf655-e108-4d4f-8286-44ea29d8a9e6",
+        "privy-client": "react-auth:3.6.0",
+        "origin": "https://limitless.exchange",
+      }
+    }
+  );
+  return res.data;
+}
+
+async function init(wallet) {
+  const url = 'https://auth.privy.io/api/v1/siwe/init';
+  const res = await axios.post(url,
+    { address: wallet.address },
+    {
+      timeout: 15000,
+      headers: {
+        "privy-app-id": "cm5pgksxs05f9428uup8tuyd4",
+        "privy-ca-id": "b37bf655-e108-4d4f-8286-44ea29d8a9e6",
+        "privy-client": "react-auth:3.6.0",
+        "origin": "https://limitless.exchange",
+      }
+    }
+  );
+  return res.data;
+}
+
 async function claimRewards(wallet) {
   logInfo(wallet.address, '⏳', 'claim rewards...');
-  const positions = await getPositions();
+  const params = await init(wallet);
+  const { identity_token } = await authenticate(wallet, params);
+  const positions = await getPositions(identity_token);
   const claims = (positions?.amm || []).filter(e => e.market.closed && e.realizedPnl >= 0);
 
   const conditional = new ethers.Contract(CONDITIONALTOKENS_ADDRESS, CONDITIONALTOKENS_ABI, wallet);
