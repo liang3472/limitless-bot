@@ -7,6 +7,8 @@ const path = require('path');
 const MARKET_ABI = require('./abis/Market.json');
 const ERC20_ABI = require('./abis/ERC20.json');
 const ERC1155_ABI = require('./abis/ERC1155.json');
+const CONDITIONALTOKENS_ABI = require('./abis/ConditionalTokens.json');
+const CONDITIONALTOKENS_ADDRESS = '0xC9c98965297Bc527861c898329Ee280632B76e18';
 
 // ========= Config =========
 const RPC_URL = process.env.RPC_URL;
@@ -14,6 +16,7 @@ const CHAIN_ID = parseInt(process.env.CHAIN_ID || '8453', 10);
 const PRICE_ORACLE_ID = process.env.PRICE_ORACLE_ID;
 const FREQUENCY = process.env.FREQUENCY || 'hourly';
 const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS || '10000', 10);
+const CLAIMS_INTERVAL_MS = parseInt(process.env.CLAIMS_INTERVAL_MS || '60000', 10);
 const BUY_AMOUNT_USDC = process.env.BUY_AMOUNT_USDC ? Number(process.env.BUY_AMOUNT_USDC) : 5; // human units
 const TARGET_PROFIT_PCT = process.env.TARGET_PROFIT_PCT ? Number(process.env.TARGET_PROFIT_PCT) : 20; // 20%
 const SLIPPAGE_BPS = process.env.SLIPPAGE_BPS ? Number(process.env.SLIPPAGE_BPS) : 100; // 1%
@@ -22,6 +25,7 @@ const CONFIRMATIONS = parseInt(process.env.CONFIRMATIONS || '1', 10);
 const STRATEGY_MODE = (process.env.STRATEGY_MODE || 'dominant').toLowerCase();
 const TRIGGER_PCT = process.env.TRIGGER_PCT ? Number(process.env.TRIGGER_PCT) : 60;
 const TRIGGER_BAND = process.env.TRIGGER_BAND ? Number(process.env.TRIGGER_BAND) : 5;
+const AUTH_TOKEN = process.env.AUTH_TOKEN;
 const LOOKBACK_BLOCKS = parseInt(process.env.LOOKBACK_BLOCKS || '500000', 10);
 
 const PRIVATE_KEYS = (process.env.PRIVATE_KEYS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -105,7 +109,7 @@ function markMarketCompleted(addr, marketAddress) {
 
 // ========= Persistence =========
 function ensureDirSync(dir) {
-  try { fs.mkdirSync(dir, { recursive: true }); } catch (_) {}
+  try { fs.mkdirSync(dir, { recursive: true }); } catch (_) { }
 }
 
 function serializeState() {
@@ -201,6 +205,12 @@ function fmtUnitsPrec(amount, decimals, precision = 4) {
   }
 }
 
+async function getPositions() {
+  const url = 'https://api.limitless.exchange/portfolio/positions';
+  const res = await axios.get(url, { timeout: 15000, headers: { identity: AUTH_TOKEN } });
+  return res.data;
+}
+
 async function fetchMarket() {
   const url = `https://api.limitless.exchange/markets/prophet?priceOracleId=${PRICE_ORACLE_ID}&frequency=${FREQUENCY}`;
   const res = await axios.get(url, { timeout: 15000 });
@@ -217,7 +227,7 @@ async function readAllowance(usdc, owner, spender) {
       if (fn && fn.staticCall) {
         return await fn.staticCall(owner, spender);
       }
-    } catch (_) {}
+    } catch (_) { }
     throw e;
   }
 }
@@ -671,6 +681,21 @@ async function runForWallet(wallet, provider) {
   return setInterval(tick, POLL_INTERVAL_MS);
 }
 
+async function claimRewards(wallet) {
+  logInfo(wallet.address, '⏳', 'claim rewards...');
+  const positions = await getPositions();
+  const claims = (positions?.amm || []).filter(e => e.market.closed && e.realizedPnl >= 0);
+
+  const conditional = new ethers.Contract(CONDITIONALTOKENS_ADDRESS, CONDITIONALTOKENS_ABI, wallet);
+  for (let claim of claims) {
+    const { collateralToken, conditionId } = claim.market;
+    const tx = await conditional.redeemPositions(collateralToken.address, '0x0000000000000000000000000000000000000000000000000000000000000000', conditionId, ['1', '2']);
+    logInfo(wallet.address, '🧾', `claim tx: ${tx.hash}`);
+    const receipt = await tx.wait(CONFIRMATIONS);
+    logInfo(wallet.address, '✅', `claim completed in block ${receipt.blockNumber}`);
+  }
+}
+
 async function main() {
   console.log('🚀 Starting Limitless bot on Base...');
   const provider = new ethers.JsonRpcProvider(RPC_URL);
@@ -718,6 +743,10 @@ async function main() {
     timers.push(timer);
   }
 
+  for (const w of wallets) {
+    const timer = setInterval(() => claimRewards(w), CLAIMS_INTERVAL_MS);
+    timers.push(timer);
+  }
   process.on('SIGINT', () => {
     console.log('👋 Shutting down...');
     timers.forEach(t => clearInterval(t));
